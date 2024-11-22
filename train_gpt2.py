@@ -1,5 +1,9 @@
+from functools import partial
+import math
 import os
 import sys
+
+from tqdm import tqdm
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import uuid
@@ -16,7 +20,20 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-flex_attention = torch.compile(flex_attention, dynamic=False)
+flex_attention = torch.compile(
+    partial(
+        flex_attention,
+        kernel_options = {
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "BLOCK_M1": 32,
+            "BLOCK_N1": 64,
+            "BLOCK_M2": 64,
+            "BLOCK_N2": 32,
+        },
+    ),
+    dynamic=False
+)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 # -----------------------------------------------------------------------------
@@ -222,6 +239,110 @@ class Block(nn.Module):
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x, v1
 
+
+class Pattention(nn.Module):
+    """Pattention Layer.
+    """
+
+    def __init__(
+        self,
+        input_channels,
+        output_channels,
+        param_token_num,
+        param_key_init_method="kaiming_uniform",
+        param_value_init_method="kaiming_uniform",
+        norm_activation_type="l2_norm_gelu"
+    ):
+        super().__init__()
+
+        self.param_token_num = param_token_num
+        self.param_key_dim = input_channels
+        self.param_value_dim = output_channels
+        self.norm_activation_type = norm_activation_type
+        
+        self.key_param_tokens = nn.parameter.Parameter(
+            data=torch.rand((self.param_token_num, self.param_key_dim)))
+        self.value_param_tokens = nn.parameter.Parameter(
+            data=torch.rand((self.param_token_num, self.param_value_dim)))
+        
+        def get_init_methods(init_method):
+            if init_method == 'xavier_uniform':
+                return torch.nn.init.xavier_uniform_
+            elif init_method == 'xavier_normal':
+                return torch.nn.init.xavier_normal_
+            elif init_method == 'kaiming_uniform':
+                return torch.nn.init.kaiming_uniform_
+            elif init_method == 'kaiming_normal':
+                return torch.nn.init.kaiming_normal_
+            elif init_method == 'orthogonal':
+                return torch.nn.init.orthogonal_
+            elif init_method == 'uniform':
+                return torch.nn.init.uniform_
+            elif init_method == 'normal':
+                return torch.nn.init.normal_
+            else:
+                raise NotImplementedError
+        
+        if isinstance(param_key_init_method, str):
+            param_key_init_method = get_init_methods(param_key_init_method)
+        
+        if isinstance(param_value_init_method, str):
+            param_value_init_method = get_init_methods(param_value_init_method)
+        
+        param_key_init_method(self.key_param_tokens)
+        param_value_init_method(self.value_param_tokens)
+    
+    def nonlinear_norm_func(self, inputs, normalize_type, dim=-1):
+        if normalize_type == 'softmax': 
+            # NOTE: softmax = exp_l1_norm
+            # outputs = F.softmax(inputs, dim=dim) * inputs.shape[dim]
+            nonlinear_outputs = torch.exp(inputs)
+            norm_outputs = nonlinear_outputs / torch.norm(nonlinear_outputs, p=1, dim=dim, keepdim=True) * inputs.shape[dim]
+            outputs = norm_outputs
+        elif normalize_type == 'gelu_l2_norm':
+            nonlinear_outputs = F.gelu(inputs)
+            norm_outputs = nonlinear_outputs / torch.norm(nonlinear_outputs, p=2, dim=dim, keepdim=True) * math.sqrt(nonlinear_outputs.shape[dim])
+            outputs = norm_outputs
+        elif normalize_type == 'l2_norm_gelu':
+            norm_outputs = inputs / torch.norm(inputs, p=2, dim=dim, keepdim=True) * math.sqrt(inputs.shape[dim])
+            nonlinear_outputs = F.gelu(norm_outputs)
+            outputs = nonlinear_outputs
+        else:
+            raise NotImplementedError
+        return outputs
+
+    def forward(self, inputs, dropout_p=0.0, router_index=None, attn_mask=None, scale=None):
+
+        query = inputs
+        if router_index is None:
+            # not MoE mode
+            key, value = self.key_param_tokens, self.value_param_tokens
+        else:
+            key, value = self.key_param_tokens[router_index], self.value_param_tokens[router_index]
+        
+        L, S = query.size(-2), key.size(-2)
+        scale_factor = 1 if scale is None else scale 
+        # just for gelu nonlinear, set torch.zeros for softmax
+        attn_bias = torch.ones(L, S, dtype=query.dtype, device=query.device)
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                # just for gelu nonlinear, set -inf for softmax
+                attn_bias.masked_fill_(attn_mask.logical_not(), 0)
+            else:
+                raise NotImplementedError
+
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+        # just for gelu nonlinear, set attn_weight += attn_bias for softmax
+        attn_weight *= attn_bias
+        # modified softmax
+        attn_weight = self.nonlinear_norm_func(attn_weight, self.norm_activation_type, dim=-1)
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+        output = attn_weight @ value
+
+        return output
+
+
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
 
@@ -231,6 +352,25 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    use_pattention : bool = True
+    pattention_num_param_tokens: int = 256
+
+
+def patch_pattention(module: nn.Module, **kwargs):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear) and name != "lm_head":
+            setattr(
+                module,
+                name,
+                Pattention(
+                    child.in_features,
+                    child.out_features,
+                    **kwargs
+                )
+            )
+        else:
+            patch_pattention(child, **kwargs)
+
 
 class GPT(nn.Module):
 
@@ -249,6 +389,9 @@ class GPT(nn.Module):
         ))
         self.lm_head = CastedLinear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight.data.zero_() # @Grad62304977
+        
+        if config.use_pattention:
+            patch_pattention(self, param_token_num=config.pattention_num_param_tokens)
 
     def forward(self, idx, target):
 
@@ -358,6 +501,7 @@ class DistributedDataLoader:
             self.advance()
         return x.cuda(), y.cuda()
 
+
 # -----------------------------------------------------------------------------
 # int main
 
@@ -369,7 +513,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
-    sequence_length : int = 64*1024 # sequence length, in tokens
+    sequence_length : int = 32*1024 # sequence length, in tokens
     num_iterations : int = 1875 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -378,6 +522,8 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -445,6 +591,10 @@ for m in model.modules():
         m.float()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
+
+print(model)
+print(f'Num parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
+
 model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
@@ -480,6 +630,8 @@ def get_lr(it):
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
+
+print('foo')
 
 # Start training loop
 training_time_ms = 0
