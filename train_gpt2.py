@@ -9,7 +9,7 @@ with open(sys.argv[0]) as f:
 import uuid
 import glob
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import numpy as np
 import torch
@@ -20,20 +20,7 @@ import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 # Use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import flex_attention, create_block_mask
-flex_attention = torch.compile(
-    partial(
-        flex_attention,
-        kernel_options = {
-            "BLOCK_M": 64,
-            "BLOCK_N": 64,
-            "BLOCK_M1": 32,
-            "BLOCK_N1": 64,
-            "BLOCK_M2": 64,
-            "BLOCK_N2": 32,
-        },
-    ),
-    dynamic=False
-)
+flex_attention = torch.compile(flex_attention, dynamic=False)
 create_block_mask = torch.compile(create_block_mask, dynamic=False)
 
 # -----------------------------------------------------------------------------
@@ -251,7 +238,8 @@ class Pattention(nn.Module):
         param_token_num,
         param_key_init_method="kaiming_uniform",
         param_value_init_method="kaiming_uniform",
-        norm_activation_type="l2_norm_gelu"
+        norm_activation_type="l2_norm_gelu",
+        active_param_tokens: int | float | None = None,
     ):
         super().__init__()
 
@@ -261,9 +249,9 @@ class Pattention(nn.Module):
         self.norm_activation_type = norm_activation_type
         
         self.key_param_tokens = nn.parameter.Parameter(
-            data=torch.rand((self.param_token_num, self.param_key_dim)))
+            data=torch.zeros((self.param_token_num, self.param_key_dim)))
         self.value_param_tokens = nn.parameter.Parameter(
-            data=torch.rand((self.param_token_num, self.param_value_dim)))
+            data=torch.zeros((self.param_token_num, self.param_value_dim)))
         
         def get_init_methods(init_method):
             if init_method == 'xavier_uniform':
@@ -291,6 +279,21 @@ class Pattention(nn.Module):
         
         param_key_init_method(self.key_param_tokens)
         param_value_init_method(self.value_param_tokens)
+        
+        if active_param_tokens is not None:
+            if isinstance(active_param_tokens, float):
+                active_param_tokens = int(active_param_tokens * self.param_token_num)
+            
+            assert active_param_tokens <= self.param_token_num
+            
+            self.active_param_tokens = active_param_tokens
+            
+            with torch.no_grad():
+                self.key_param_tokens[active_param_tokens:].zero_()
+                self.value_param_tokens[active_param_tokens:].zero_()
+        else:
+            self.active_param_tokens = self.param_token_num
+            
     
     def nonlinear_norm_func(self, inputs, normalize_type, dim=-1):
         if normalize_type == 'softmax': 
@@ -310,34 +313,34 @@ class Pattention(nn.Module):
         else:
             raise NotImplementedError
         return outputs
+    
+    def set_active_param_tokens(self, active_param_tokens: int | float):
+        if isinstance(active_param_tokens, float):
+            active_param_tokens = int(active_param_tokens * self.param_token_num)
+            
+        if active_param_tokens == self.active_param_tokens:
+            return
+        
+        print(f"Seting active_param_tokens: {active_param_tokens} from {self.active_param_tokens}")
+        
+        assert active_param_tokens <= self.param_token_num
+        assert active_param_tokens > self.active_param_tokens
+        self.active_param_tokens = active_param_tokens
 
-    def forward(self, inputs, dropout_p=0.0, router_index=None, attn_mask=None, scale=None):
+    def forward(self, inputs, scale=None):
 
         query = inputs
-        if router_index is None:
-            # not MoE mode
-            key, value = self.key_param_tokens, self.value_param_tokens
-        else:
-            key, value = self.key_param_tokens[router_index], self.value_param_tokens[router_index]
+        key = self.key_param_tokens[:self.active_param_tokens]
+        value = self.value_param_tokens[:self.active_param_tokens]
         
         L, S = query.size(-2), key.size(-2)
         scale_factor = 1 if scale is None else scale 
         # just for gelu nonlinear, set torch.zeros for softmax
-        attn_bias = torch.ones(L, S, dtype=query.dtype, device=query.device)
-
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                # just for gelu nonlinear, set -inf for softmax
-                attn_bias.masked_fill_(attn_mask.logical_not(), 0)
-            else:
-                raise NotImplementedError
 
         attn_weight = query @ key.transpose(-2, -1) * scale_factor
         # just for gelu nonlinear, set attn_weight += attn_bias for softmax
-        attn_weight *= attn_bias
         # modified softmax
         attn_weight = self.nonlinear_norm_func(attn_weight, self.norm_activation_type, dim=-1)
-        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
         output = attn_weight @ value
 
         return output
@@ -353,7 +356,7 @@ class GPTConfig:
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
     use_pattention : bool = True
-    pattention_num_param_tokens: int = 256
+    active_param_tokens : int | float = 0.25
 
 
 def patch_pattention(module: nn.Module, **kwargs):
@@ -365,6 +368,7 @@ def patch_pattention(module: nn.Module, **kwargs):
                 Pattention(
                     child.in_features,
                     child.out_features,
+                    param_token_num=child.out_features // 4,
                     **kwargs
                 )
             )
@@ -391,7 +395,12 @@ class GPT(nn.Module):
         self.lm_head.weight.data.zero_() # @Grad62304977
         
         if config.use_pattention:
-            patch_pattention(self, param_token_num=config.pattention_num_param_tokens)
+            patch_pattention(self, active_param_tokens=config.active_param_tokens)
+            
+    def set_active_param_tokens(self, active_param_tokens: int | float):
+        for mod in self.modules():
+            if isinstance(mod, Pattention):
+                mod.set_active_param_tokens(active_param_tokens)
 
     def forward(self, idx, target):
 
@@ -513,7 +522,7 @@ class Hyperparameters:
     # optimization hyperparams
     batch_size : int = 8 # batch size, in sequences, across all devices
     device_batch_size : int = 1 # batch size, in sequences, per device
-    sequence_length : int = 32*1024 # sequence length, in tokens
+    sequence_length : int = 64*1024 # sequence length, in tokens
     num_iterations : int = 1875 # number of iterations to run
     warmup_iters : int = 0
     warmdown_iters : int = 562 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -522,6 +531,12 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+    active_param_tokens_schedule = {
+        0.0: 0.25,
+        0.05: 0.5,
+        0.1: 1.0
+    }
+    wandb_project: str | None = "modded-nanogpt"
 
 
 args = Hyperparameters()
@@ -595,7 +610,7 @@ if hasattr(config, "coordinate_descent_tuning"):
 print(model)
 print(f'Num parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}')
 
-model = torch.compile(model)
+# model = torch.compile(model)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -631,7 +646,16 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
-print('foo')
+if args.wandb_project is not None:
+    try:
+        import wandb
+        run = wandb.init(project=args.wandb_project, config=asdict(args))
+    except ImportError:
+        print("wandb not installed, skipping logging")
+        run = None
+else:
+    run = None
+        
 
 # Start training loop
 training_time_ms = 0
@@ -640,6 +664,13 @@ torch.cuda.synchronize()
 t0 = time.time()
 # begin training
 for step in range(args.num_iterations + 1):
+    rel_step = step / args.num_iterations
+    
+    active_param_tokens_schedule_step = max(filter(lambda x: x <= rel_step, args.active_param_tokens_schedule.keys()))
+    active_param_tokens = args.active_param_tokens_schedule[active_param_tokens_schedule_step]
+    
+    raw_model.set_active_param_tokens(active_param_tokens)
+    
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -669,7 +700,10 @@ for step in range(args.num_iterations + 1):
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
-
+        
+        if run is not None:
+            run.log({"val/loss": val_loss.item()})
+    
     if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
@@ -719,6 +753,9 @@ for step in range(args.num_iterations + 1):
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     approx_time = training_time_ms + 1000 * (time.time() - t0)
     print0(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+    
+    if run is not None:
+        run.log({"train/loss": train_loss.item()})
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
